@@ -1,4 +1,4 @@
-<p align="center">
+﻿<p align="center">
 <a href="https://github.com/nari-labs/dia">
 <img src="./dia/static/images/banner.png">
 </a>
@@ -45,7 +45,7 @@ cd dia && uv run app.py
 
 or if you do not have `uv` pre-installed:
 
-```bash
+```base
 git clone https://github.com/nari-labs/dia.git
 cd dia
 python -m venv .venv
@@ -84,6 +84,187 @@ model.save_audio("simple.mp3", output)
 ```
 
 A pypi package and a working CLI tool will be available soon.
+
+## 🚀 FastAPI Server for Local Use
+
+This repository also includes a simple FastAPI server providing a local API endpoint for text-to-speech (TTS) generation using the Dia model. This server is designed primarily for local use, allowing other applications on the same machine or local network to easily generate audio via HTTP requests. It utilizes a server-side prompt management system for voice selection.
+
+**Server Features:**
+- Provides a /tts endpoint for audio generation.
+- Uses FastAPI and Uvicorn for the web server.
+- Loads the specified Nari Dia model (PyTorch).
+- Manages voice prompts server-side via a prompts directory.
+- Supports overriding default generation parameters (temperature, seed, speed, etc.) via the API request.
+- Packaged as an installable Python package (nari-tts) with a console script to run the server.
+
+### Server Prerequisites
+- Python 3.10+
+- pip or a compatible package manager (like uv)
+- PyTorch installed (compatible with your system - CPU or CUDA GPU recommended). See PyTorch installation guide.
+- A CUDA-enabled GPU is highly recommended for reasonable generation speed. CPU generation will be very slow.
+
+### Server Installation
+**(Requires cloning the repository first if not done already)**
+1. Navigate to the repository root directory.
+2. Create and activate a virtual environment (recommended):
+```
+python -m venv .venv
+# Windows
+.\.venv\Scripts\activate
+# Linux/macOS
+source .venv/bin/activate
+```
+3. Install the package and dependencies:
+   This will install the server code and all dependencies listed in `pyproject.toml`, including the `dia` library, FastAPI, and Uvicorn.
+```
+pip install .
+# Or for development (editable install):
+# pip install -e .
+```
+This also installs the `nari-tts` console script.
+
+### Server Configuration
+1. Prompt Setup (Server-Side)
+
+- **Create** a `prompts` **Directory:** By default, the server looks for a directory named `prompts` in the location where you run the `nari-tts` command. You can change this using the `--prompts-dir` argument or `NARI_PROMPTS_DIR` environment variable.
+- **Add Prompt Fields:** Inside the `prompts` directory, add pairs of files for each desired voice prompt:
+  - `<promp_id_>.wav`: The audio file for the prompt. MUST be a MONO WAV file. The model expects mono input.
+  - `<prompt_id_>.txt`: A plain text file containing the exact transcript of the corresponding `.wav` file, including any speaker tags (eg. `[S1]`) used by the model.
+- `<prompt_id>`: The base filename (without the extension) is used as the `prompt_id` in API requests to select that voice.
+
+2. Server Options (Environment Variables / CLI Arguments)
+You can configure the server's behavior using command-line arguments or environment variables. CLI arguments take precedence over environment variables, which take precedence over defaults.
+
+| Feature | CLI Argument | Enviornment Variable | Default Value | Description |
+|:-:|:-:|:-:|:-:|:-:|
+| Host Address | `--host` | `NARI_HOST` | `0.0.0.0` | Network address to bind the server. |
+| Port Number | `--port` | `NARI_PORT` | `8210` | Port number for the server. | 
+| Prompts Directory | `--prompts-dir` | `NARI_PROMPTS_DIR` | `prompts` | Path to the directory containing prompt `.wav / .txt` files. | 
+| Default Prompt ID | `--default-prompt` | `NARI_DEFAULT_PROMPT` | `default_voice` | `prompt_id` used if none is specified in the request. Must match a file pair. |
+| Model Name/Path | `--model-name` | `NARI_MODEL_NAME` | `nari-labs/Dia-1.6B` | Hugging Face model name or local path to load. |
+| Enable Torch Compile | `--use-torch-compile / --no-use-torch-comnpile` | `NARI_USE_COMPILE (true/false)` | `true` | Whether to use `torch.compile` for potential speedup. |
+| Development Reload | `--reload` | (N/A) | `False` | Enable Uvicorn's audo-reload feature for development |
+
+### Running the Server
+Once installed and configured (ensure your prompts directory is set up), run the server using the console script:
+```
+nari-tts [OPTIONS]
+```
+
+**Examples**
+- Run with defaults:
+```
+nari-tts
+```
+- Run on a different port and specify a custom prompts directory:
+```
+nari-tts ---port 9000 ---prompts-dir /path/to/my/audio/prompts
+```
+- Run without Torch Compile:
+```
+nari-tts --no-use-torch-compile
+```
+- Run using enviornment variables (Linux/macOS example):
+```
+export NARI_DEFAULT_PROMPT="rubi"
+export NARI_PROMPTS_DIR="./my_prompts"
+nari-tts --port 8080
+```
+
+The server will start, load the model, and listen for requests on the configured host and port. Watch the console logs for status information and potential errors.
+
+### API Endpoint: `/tts`
+This is the primary endpoint for generating speech.
+- URL: `/tts` (relative to the server's base URL, e.g., http://localhost:8210/tts)
+- Method:`POST`
+- Request Format: `application/json`
+
+#### Request Body
+The request body should be a JSON object containing the following fields:
+| `Field` | Type | Required | Default | Description |
+|:-:|:-:|:-:|:-:|:-:|
+| `text` | `string` | Yes | (N/A) | The text content to be synthesized into speech. |
+| `prompt_id` | `string` | No | Server Default* | The identifier (base filename) of the server-side prompt (.wav/.txt) to use for the voice. |
+| `max_new_tokens` | `integer` | No | 3072 | Maximum number of new audio tokens to generate. Must be > 0. |
+| `cfg_scale` | `number` | No | `3.0` | Classifier-Free Guidance scale. Higher = stricter adherence to text/prompt. Must be >= 1.0. |
+| `temperature` | `number` | No | `1.3` | Sampling temperature. Controls randomness (>0.0). Lower values = more deterministic. |
+| `top_p` | `number` | No | `0.95` | Nucleus sampling threshold (0.0 < top_p <= 1.0). |
+| `cfg_filter_top_k` | `integer` | No | `30` | Filters guidance logits to the top K values during CFG. Must be >= 1. |
+| `speed_factor` | `number` | No | `1.0` | Audio speed multiplier (>0.1). <1.0 is slower, >1.0 is faster. Note: Nari default was 0.94 |
+| `seed` | `integer` | No | `null` (Random) | Random seed for generating reproducible audio. If null or omitted, output will be random. |
+
+*If `prompt_id` is null or omitted, the server uses the prompt ID configured via `--default-prompt` or `NARI_DEFAULT_PROMPT`. If that is also not configured or the files don't exist, generation proceeds without a voice prompt (which may result in poor quality or silence).
+
+#### Success Response
+- Status Code: `200 OK`
+- Content-Type: `audio/wav`
+- Headers: Includes `Content-Length` indicating the size of the audio data in bytes.
+- Body: The raw binary data of the generated WAV audio file.
+
+#### Error Responses
+The server returns standard HTTP error codes with a JSON body containing a detail field explaining the error.
+- `400 Bad Request:` Invalid input provided in the request body (e.g., `text` is empty, a numeric parameter is out of range). The `detail` message specifies the issue.
+- `404 Not Found:` The requested `prompt_id` does not correspond to existing `.wav` and `.txt` files in the server's `prompts` directory.
+- `500 Internal Server Error:` An unexpected error occurred during model generation, audio processing, or WAV encoding on the server. Check server logs for detailed tracebacks.
+- `503 Service Unavailable:` The TTS model failed to load during server startup or is otherwise unavailable. Check server startup logs.
+
+#### Example API Usage
+```
+curl -X POST "http://localhost:8210/tts" \
+     -H "Content-Type: application/json" \
+     -H "Accept: audio/wav" \
+     -d '{
+           "text": "[S1] This is a test using curl.",
+           "prompt_id": "rubi",
+           "seed": 42,
+           "temperature": 0.9
+         }' \
+     --output curl_output.wav
+```
+
+(This saves the generated audio to curl_output.wav)
+
+```
+import requests
+import json
+
+SERVER_URL = "http://localhost:8210/tts" # Replace with your server's URL if different
+OUTPUT_FILE = "python_output.wav"
+
+payload = {
+    "text": "[S1] Testing audio generation from Python.",
+    "prompt_id": "rubi", # Or None to use server default
+    "seed": 123,
+    "speed_factor": 1.0
+    # Add other parameters as needed
+}
+
+print(f"Sending request to {SERVER_URL}")
+try:
+    response = requests.post(
+        SERVER_URL,
+        headers={"Content-Type": "application/json", "Accept": "audio/wav"},
+        json=payload,
+        stream=True,
+        timeout=180 # Set a reasonable timeout (seconds)
+    )
+
+    if response.status_code == 200:
+        print(f"Success! Saving audio to {OUTPUT_FILE}")
+        with open(OUTPUT_FILE, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    else:
+        print(f"Error: Server returned status code {response.status_code}")
+        try:
+            error_details = response.json()
+            print(f"Error details: {error_details}")
+        except json.JSONDecodeError:
+            print(f"Error details (raw): {response.text}")
+
+except requests.exceptions.RequestException as e:
+    print(f"Request failed: {e}")
+```
 
 ## 💻 Hardware and Inference Speed
 
