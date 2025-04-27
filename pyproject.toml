@@ -20,7 +20,12 @@ dependencies = [
     "torchaudio==2.6.0",
     "triton==3.2.0 ; sys_platform == 'linux'",
     "triton-windows==3.2.0.post18 ; sys_platform == 'win32'",
+    "fastapi",
+    "uvicorn[standard]",
 ]
+
+[project.scripts]
+nari-tts = "tts_server:run"
 
 [build-system]
 requires = ["hatchling"]
