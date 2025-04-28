@@ -166,7 +166,7 @@ nari-tts --no-use-torch-compile
 ```
 - Run using enviornment variables (Linux/macOS example):
 ```
-export NARI_DEFAULT_PROMPT="rubi"
+export NARI_DEFAULT_PROMPT="example_prompt"
 export NARI_PROMPTS_DIR="./my_prompts"
 nari-tts --port 8080
 ```
@@ -215,7 +215,7 @@ curl -X POST "http://localhost:8210/tts" \
      -H "Accept: audio/wav" \
      -d '{
            "text": "[S1] This is a test using curl.",
-           "prompt_id": "rubi",
+           "prompt_id": "example_prompt",
            "seed": 42,
            "temperature": 0.9
          }' \
@@ -233,7 +233,7 @@ OUTPUT_FILE = "python_output.wav"
 
 payload = {
     "text": "[S1] Testing audio generation from Python.",
-    "prompt_id": "rubi", # Or None to use server default
+    "prompt_id": "example_prompt", # Or None to use server default
     "seed": 123,
     "speed_factor": 1.0
     # Add other parameters as needed
