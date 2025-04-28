@@ -9,7 +9,8 @@ import traceback
 from pathlib import Path
 import argparse
 import logging
-from typing import Optional, List # Moved List here
+import time
+from typing import Optional, List
 
 # Third-party imports
 import numpy as np
@@ -43,7 +44,6 @@ DEFAULT_MODEL_NAME = os.getenv("NARI_MODEL_NAME", "nari-labs/Dia-1.6B")
 DEFAULT_HOST = os.getenv("NARI_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("NARI_PORT", "8210"))
 DEFAULT_USE_TORCH_COMPILE_STR = os.getenv("NARI_USE_COMPILE", "true").lower()
-# SUPPORTED_AUDIO_EXTENSIONS was defined above, removed duplicate definition here
 
 # --- Effective Configuration (Set in main block) ---
 # These will hold the final configuration values used by the application after parsing args/env
@@ -57,7 +57,7 @@ EFFECTIVE_USE_TORCH_COMPILE: bool = DEFAULT_USE_TORCH_COMPILE_STR == "true"
 # Global variable to hold the loaded model and its properties
 tts_model = None
 model_sample_rate = DEFAULT_MODEL_SAMPLE_RATE # Initialize with default
-compute_device = torch.device("cpu") # Default, updated during model load
+compute_device = None # Default, updated during model load
 
 # --- Pydantic Model for API Request ---
 class TTSRequest(BaseModel):
@@ -74,7 +74,8 @@ class TTSRequest(BaseModel):
 
     class Config:
         # Example for generating OpenAPI schema documentation
-        schema_extra = {
+        # Renamed from schema_extra for Pydantic V2 compatibility
+        json_schema_extra = {
             "example": {
                 "text": "[S1] This is a test sentence.",
                 "prompt_id": "default_voice",
@@ -91,21 +92,18 @@ def load_model():
         logger.info("Model already loaded.")
         return
 
-    logger.info("--- Loading TTS Model ---")
     logger.info(f"Model Name: {EFFECTIVE_MODEL_NAME}")
 
-    logger.info("Determining compute device...")
+    # Determine Device and set global variable directly
     if torch.cuda.is_available():
         compute_device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        try:
-            torch.zeros(1, device=torch.device("mps"))
-            compute_device = torch.device("mps")
-        except Exception:
-            logger.warning("MPS available but verification failed, falling back to CPU.")
-            compute_device = torch.device("cpu")
     else:
         compute_device = torch.device("cpu")
+
+    if compute_device is None:
+        logger.error("FATAL: Compute device could not be determined! Falling back to CPU.")
+        compute_device = torch.device("cpu")
+
     logger.info(f"Using device: {compute_device}")
 
     logger.info("Loading model weights...")
@@ -114,12 +112,14 @@ def load_model():
         if not hasattr(Dia, 'from_pretrained'):
              raise ImportError("Imported 'Dia' class does not have 'from_pretrained' method.")
 
-        compute_dtype = torch.float16 if compute_device != torch.device("cpu") else torch.float32
-        logger.info(f"Using compute dtype: {compute_dtype}")
+        if compute_device == torch.device("cuda") or compute_device == torch.device("mps"):
+            compute_dtype_str_for_dia = "float16"
+        else:
+            compute_dtype_str_for_dia = "float32"
 
         tts_model = Dia.from_pretrained(
             EFFECTIVE_MODEL_NAME,
-            compute_dtype=compute_dtype,
+            compute_dtype=compute_dtype_str_for_dia,
             device=compute_device
         )
         logger.info("Nari Dia model loaded successfully.")
@@ -152,7 +152,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Nari TTS API Server",
         description=f"FastAPI server for {EFFECTIVE_MODEL_NAME} TTS, using server-side prompts.",
-        version="0.3.2" # Version bump for cleanup
+        version="0.3.3" # Version bump for pydantic fix
     )
 
     @app.on_event("startup")
@@ -201,7 +201,17 @@ def create_app() -> FastAPI:
     # --- API Endpoint (/tts) ---
     @app.post(
         "/tts",
-        # ... (FastAPI metadata remains the same) ...
+        response_class=StreamingResponse,
+        tags=["TTS Generation"],
+        summary="Generate Speech Audio",
+        response_description="Streaming WAV audio data.",
+        responses={
+            200: {"description": "Successful TTS Generation", "content": {"audio/wav": {}}},
+            400: {"description": "Invalid input parameters (e.g., empty text, invalid values)"},
+            404: {"description": "Requested prompt_id not found"},
+            500: {"description": "Internal server error during generation or processing"},
+            503: {"description": "Model not loaded or unavailable"},
+        }
     )
     async def synthesize(req: TTSRequest):
         """
@@ -243,26 +253,22 @@ def create_app() -> FastAPI:
             selected_prompt_id = req.prompt_id if req.prompt_id else EFFECTIVE_DEFAULT_PROMPT_ID
             logger.info(f"Processing with prompt_id: {selected_prompt_id or 'None (using default/no prompt)'}")
 
-            # Removed redundant initialization of prompt_audio_path/prompt_transcript_path here
-
             if selected_prompt_id:
                 # --- Find Transcript File ---
-                prompt_transcript_path = (EFFECTIVE_PROMPTS_DIR / f"{selected_prompt_id}.txt").resolve() # Defined here
+                prompt_transcript_path = (EFFECTIVE_PROMPTS_DIR / f"{selected_prompt_id}.txt").resolve()
                 if not prompt_transcript_path.is_file():
                      logger.error(f"Prompt transcript file (.txt) not found for ID '{selected_prompt_id}' at expected location: {prompt_transcript_path}")
                      raise HTTPException(status_code=404, detail=f"Prompt transcript file (.txt) not found for ID: '{selected_prompt_id}'")
                 else:
-                     # Corrected variable name typo
                      logger.info(f"Found transcript file: {prompt_transcript_path}")
 
                 # --- Find Audio File (Iterate through extensions) ---
                 found_audio_file = False
                 for ext in SUPPORTED_AUDIO_EXTENSIONS:
-                    # Corrected variable name typo
                     potential_audio_path = (EFFECTIVE_PROMPTS_DIR / f"{selected_prompt_id}{ext}").resolve()
                     logger.debug(f"Checking for audio file: {potential_audio_path}")
                     if potential_audio_path.is_file():
-                        prompt_audio_path = potential_audio_path # Assign the found path
+                        prompt_audio_path = potential_audio_path
                         found_audio_file = True
                         logger.info(f"Found prompt audio file: {prompt_audio_path}")
                         break
@@ -273,7 +279,6 @@ def create_app() -> FastAPI:
 
                 # --- Read Transcript (using found transcript path) ---
                 try:
-                    # Use the validated prompt_transcript_path variable
                     with open(prompt_transcript_path, 'r', encoding='utf-8') as f:
                         prompt_transcript = f.read().strip()
                     if not prompt_transcript:
@@ -281,7 +286,6 @@ def create_app() -> FastAPI:
                         raise HTTPException(status_code=500, detail=f"Prompt transcript file for ID '{selected_prompt_id}' is empty.")
                     logger.info(f"Successfully read transcript for '{selected_prompt_id}'.")
                 except Exception as e:
-                    # Use the validated prompt_transcript_path variable
                     logger.error(f"Failed to read transcript file {prompt_transcript_path}: {e}", exc_info=True)
                     raise HTTPException(status_code=500, detail=f"Error reading transcript file for ID '{selected_prompt_id}'.")
 
@@ -298,12 +302,19 @@ def create_app() -> FastAPI:
             else:
                  logger.info("Using random seed.")
 
-            # --- TTS Generation ---
+            # --- TTS Generation with Timing ---
             logger.info(f"Calling model.generate...")
-            start_time = torch.cuda.Event(enable_timing=True) if compute_device.type == 'cuda' else time.time()
-            end_time = torch.cuda.Event(enable_timing=True) if compute_device.type == 'cuda' else None
 
-            if compute_device.type == 'cuda': start_time.record()
+            start_time = None
+            end_time = None
+            generation_time = -1.0
+
+            if compute_device.type == 'cuda':
+                start_time = torch.cuda.Event(enable_timing=True)
+                end_time = torch.cuda.Event(enable_timing=True)
+                start_time.record()
+            else:
+                start_time = time.time()
 
             with torch.inference_mode():
                 wav_output = tts_model.generate(
@@ -321,10 +332,13 @@ def create_app() -> FastAPI:
                 end_time.record()
                 torch.cuda.synchronize()
                 generation_time = start_time.elapsed_time(end_time) / 1000.0
-            else:
-                generation_time = time.time() - start_time # Calculate CPU time
+            elif start_time is not None:
+                generation_time = time.time() - start_time
 
-            logger.info(f"Model generation complete in {generation_time:.2f} seconds.")
+            if generation_time >= 0:
+                logger.info(f"Model generation complete in {generation_time:.2f} seconds.")
+            else:
+                logger.warning("Could not accurately measure model generation time.")
             # --- End TTS Generation ---
 
             # --- Post-processing ---
@@ -437,8 +451,6 @@ def run_server(host: str, port: int, reload: bool, prompts_dir: Path, default_pr
 
     if reload:
         logger.info("Running Uvicorn with reload enabled. Configuration passed via environment variables.")
-        # ... (env_config and uvicorn.run call for reload) ...
-        # Ensure env_config is correctly defined as in the previous version
         env_config = {
             "NARI_PROMPTS_DIR": str(EFFECTIVE_PROMPTS_DIR),
             "NARI_DEFAULT_PROMPT": EFFECTIVE_DEFAULT_PROMPT_ID or "", # Env var needs a string
@@ -456,13 +468,14 @@ def run_server(host: str, port: int, reload: bool, prompts_dir: Path, default_pr
         app_instance = create_app()
         uvicorn.run(app_instance, host=host, port=port, reload=False)
 
-# --- Main Execution Guard ---
-if __name__ == "__main__":
+
+# --- Main Entry Point Function (for Console Script) ---
+def run():
+    """Parses command-line arguments and starts the server."""
     parser = argparse.ArgumentParser(
         description=f"Run Nari TTS FastAPI Server ({DEFAULT_MODEL_NAME})",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
         )
-    # ... (argparse definitions remain the same) ...
     parser.add_argument("--host", type=str, default=DEFAULT_HOST,
                         help="Host address to bind the server to.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
@@ -470,7 +483,7 @@ if __name__ == "__main__":
     parser.add_argument("--reload", action="store_true",
                         help="Enable auto-reload mode for development. Requires Uvicorn[standard].")
     parser.add_argument("--prompts-dir", type=str, default=DEFAULT_PROMPTS_DIR_STR,
-                        help="Directory containing prompt audio and corresponding .txt files.")
+                        help="Directory containing prompt audio and corresponding .txt files.") # Updated help
     parser.add_argument("--default-prompt", type=str, default=DEFAULT_PROMPT_ID,
                         help="Base filename (without extension) of the default prompt to use if none is specified in the request.")
     parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME,
@@ -478,12 +491,13 @@ if __name__ == "__main__":
     parser.add_argument("--use-torch-compile", action=argparse.BooleanOptionalAction, default=DEFAULT_USE_TORCH_COMPILE_STR == "true",
                         help="Enable Torch Compile for potentially faster inference (requires compatible PyTorch/GPU). Use --no-use-torch-compile to disable.")
 
-
     cli_args = parser.parse_args()
 
+    # Determine final configuration from CLI args
     final_prompts_dir = Path(cli_args.prompts_dir)
     final_default_prompt = cli_args.default_prompt if cli_args.default_prompt else ""
 
+    # Call the actual server runner with the parsed arguments
     run_server(
         host=cli_args.host,
         port=cli_args.port,
@@ -493,3 +507,9 @@ if __name__ == "__main__":
         model_name=cli_args.model_name,
         use_compile=cli_args.use_torch_compile
     )
+
+# --- Main Execution Guard ---
+# This allows running the script directly (e.g., python tts_server.py)
+# It now simply calls the 'run' function defined above.
+if __name__ == "__main__":
+    run()
